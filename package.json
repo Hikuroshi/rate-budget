@@ -1,0 +1,48 @@
+{
+  "name": "rate-budget",
+  "version": "0.1.0",
+  "description": "Provider-agnostic, storage-agnostic budget and rate limiting primitives for requests, tokens, quotas, cooldowns, and retries.",
+  "type": "module",
+  "license": "MIT",
+  "sideEffects": false,
+  "main": "./dist/cjs/index.js",
+  "module": "./dist/esm/index.js",
+  "types": "./dist/esm/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/esm/index.d.ts",
+      "import": "./dist/esm/index.js",
+      "require": "./dist/cjs/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "clean": "node scripts/clean.cjs",
+    "build": "node scripts/clean.cjs && tsc -p tsconfig.esm.json && tsc -p tsconfig.cjs.json && node scripts/write-cjs-package.cjs",
+    "test": "node scripts/clean.cjs && tsc -p tsconfig.esm.json && tsc -p tsconfig.cjs.json && node scripts/write-cjs-package.cjs && node --test test/*.test.mjs",
+    "prepack": "npm run build"
+  },
+  "keywords": [
+    "rate-limit",
+    "rate-limiter",
+    "rate-budget",
+    "quota",
+    "throttle",
+    "retry",
+    "token-budget",
+    "rpm",
+    "tpm",
+    "rpd"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}
