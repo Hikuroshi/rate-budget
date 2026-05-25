@@ -1,7 +1,7 @@
 {
   "name": "rate-budget",
-  "version": "0.1.0",
-  "description": "Provider-agnostic, storage-agnostic budget and rate limiting primitives for requests, tokens, quotas, cooldowns, and retries.",
+  "version": "1.0.0",
+  "description": "A multi-key quota decision engine for RPM, TPM, and RPD-aware routing.",
   "type": "module",
   "license": "MIT",
   "sideEffects": false,
@@ -28,16 +28,15 @@
     "prepack": "npm run build"
   },
   "keywords": [
-    "rate-limit",
-    "rate-limiter",
-    "rate-budget",
+    "multi-key",
     "quota",
-    "throttle",
-    "retry",
-    "token-budget",
+    "quota-manager",
+    "rate-limit",
+    "rate-router",
     "rpm",
     "tpm",
-    "rpd"
+    "rpd",
+    "token-budget"
   ],
   "engines": {
     "node": ">=18"

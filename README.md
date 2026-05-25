@@ -1,14 +1,17 @@
 # rate-budget
 
-`rate-budget` is a small, dependency-free toolkit for calculating request rate
-limits, quota thresholds, token or cost budgets, cooldowns, and retries.
+A multi-key quota decision engine for RPM, TPM, and RPD-aware routing.
 
-It is provider-agnostic and storage-agnostic. The package does not manage your
-database, Redis keys, queues, locks, or HTTP clients. Your application owns the
-state; `rate-budget` only calculates deterministic decisions from the counters
-and events you pass in.
+`rate-budget` selects an active key within a scope such as a tenant, workspace,
+project, user, or guild. Each key has independent RPM, TPM, and RPD limits, so
+your application can safely move to another key when one key is cooling down,
+under token pressure, or near its daily quota.
 
-## Installation
+The package is lightweight, dependency-free, and storage adapter friendly. Your
+application owns the state; `rate-budget` only computes quota decisions and
+records reservations through the configured adapter.
+
+## Install
 
 ```bash
 npm install rate-budget
@@ -16,221 +19,238 @@ pnpm add rate-budget
 yarn add rate-budget
 ```
 
-## Features
+## Core Algorithm
 
-- Request spacing for limits such as RPM, RPH, or any count-per-window limit.
-- Sliding-window cost checks for tokens, bytes, credits, points, or custom units.
-- Daily quota thresholds such as RPD with configurable safety percentages.
-- Per-request token or cost budget planning.
-- Flexible budget splitting for context, input, output, metadata, and similar allocations.
-- Lightweight in-memory actor cooldowns for single-process use cases.
-- Async retry helper with configurable status codes, message fragments, and delays.
-- ESM and CommonJS exports.
-- TypeScript declarations.
-- Zero runtime dependencies.
+RPM: spacing-based cooldown
 
-## Imports
-
-ESM:
-
-```ts
-import {
-  buildRequestLimitProfile,
-  calculateWindowUsageWaitMs,
-} from "rate-budget";
+```txt
+cooldownMs = ceil(60000 / rpm) + bufferMs
 ```
 
-CommonJS:
+TPM: sliding 60-second token window
 
-```js
-const {
-  buildRequestLimitProfile,
-  calculateWindowUsageWaitMs,
-} = require("rate-budget");
+```txt
+usedTokensLast60s + estimatedRequestTokens <= tpmLimit
 ```
 
-## Core Model
+RPD: daily threshold guard
 
-`rate-budget` is designed around pure calculations:
+```txt
+dailyCap = ceil(rpdLimit * thresholdPct / 100)
+```
 
-1. Read current usage and recent events from your own storage.
-2. Pass those values into `rate-budget`.
-3. If the decision requires waiting, delay or enqueue in your application.
-4. If the request is allowed, reserve or log the request atomically.
-5. After the request finishes, update usage in your storage.
+## Quick Start
 
-This keeps the package lightweight while still fitting distributed systems,
-serverless applications, workers, bots, and API gateways.
-
-## RPM, TPM, and RPD Example
+Use a single key when you do not need key rotation yet.
 
 ```ts
-import {
-  buildRequestLimitProfile,
-  calculateCooldownWaitMs,
-  calculateWindowUsageWaitMs,
-  evaluateCountLimit,
-} from "rate-budget";
+import { Quota } from "rate-budget";
 
-const profile = buildRequestLimitProfile({
-  rpmLimit: 15,
-  tpmLimit: 250_000,
-  rpdLimit: 500,
-  dailyThresholdPercent: 90,
-});
+const quota = new Quota();
+const key = { id: "key-a", rpm: 15, tpm: 250_000, rpd: 500 };
 
-const dailyDecision = evaluateCountLimit({
-  usedCount: usageToday.requestCount,
-  limit: profile.rpdLimit,
-  thresholdPercent: profile.dailyThresholdPercent,
-});
+const reserved = await quota.reserve("scope:123", key, { tokens: 800 });
 
-if (!dailyDecision.allowed) {
-  throw new Error("Daily quota threshold reached.");
+if (!reserved.ok) {
+  throw new Error(`Quota blocked: ${reserved.reason}`);
 }
 
-const cooldownWaitMs = calculateCooldownWaitMs({
-  lastAcceptedAt: lastApiRequest?.createdAt,
-  cooldownMs: profile.cooldownMs,
-});
+await quota.commit(reserved.hold, { tokens: 742 });
+```
 
-const tokenWaitMs = calculateWindowUsageWaitMs({
-  incomingCost: estimatedRequestTokens,
-  limit: profile.tpmLimit,
-  entries: recentApiRequests.map((request) => ({
-    occurredAt: request.createdAt,
-    cost: request.totalTokens,
-  })),
-});
+or use multiple keys with priority.
 
-const waitMs = Math.max(cooldownWaitMs, tokenWaitMs);
+```ts
+import { Quota } from "rate-budget";
 
-if (waitMs > 0) {
-  await waitOrQueue(waitMs);
+const quota = new Quota();
+
+const keys = [
+  { id: "key-a", rpm: 15, tpm: 250_000, rpd: 500, priority: 10 },
+  { id: "key-b", rpm: 15, tpm: 250_000, rpd: 500, priority: 5 },
+];
+
+const reserved = await quota.reserve("tenant:acme", keys, { tokens: 2_400 });
+
+if (!reserved.ok) {
+  if (reserved.waitMs !== null) {
+    await waitOrQueue(reserved.waitMs);
+    return;
+  }
+
+  throw new Error(`No quota key available: ${reserved.reason}`);
+}
+
+try {
+  const response = await callProvider(reserved.key, request);
+
+  await quota.commit(reserved.hold, {
+    tokens: response.usage.totalTokens,
+  });
+} catch (error) {
+  await quota.rollback(reserved.hold);
+  throw error;
 }
 ```
 
-## Sliding-Window Cost Limit
+## API
 
-Use `evaluateWindowUsage` when you need the full decision, or
-`calculateWindowUsageWaitMs` when you only need the wait time.
+### `new Quota(options?)`
 
 ```ts
-import { evaluateWindowUsage } from "rate-budget";
-
-const decision = evaluateWindowUsage({
-  incomingCost: 500,
-  limit: 10_000,
-  windowMs: 60_000,
-  safetyBufferMs: 1_000,
-  entries: [
-    { occurredAt: "2026-05-21 14:00:10", cost: 4_000 },
-    { occurredAt: "2026-05-21 14:00:30", cost: 6_200 },
-  ],
+const quota = new Quota({
+  bufferMs: 1_000,
+  thresholdPct: 90,
+  estimate: (req) => req.inputTokens + req.maxOutputTokens,
 });
+```
 
-if (!decision.allowed && decision.retryAfterMs !== null) {
-  await delay(decision.retryAfterMs);
+Options:
+
+- `store`: custom storage adapter. Defaults to `MemoryStore`.
+- `estimate(req)`: token estimator. Defaults to `req.tokens`, number request, or `1`.
+- `now()`: custom clock.
+- `id()`: reservation id generator.
+- `windowMs`: token window. Defaults to `60000`.
+- `bufferMs`: RPM/TPM safety buffer. Defaults to `1000`.
+- `thresholdPct`: RPD threshold percent. Defaults to `100`.
+- `dayKey(now)`: daily bucket key. Defaults to UTC `YYYY-MM-DD`.
+- `resetAt(now)`: timestamp for the next daily reset. Defaults to next UTC day.
+
+### `reserve(scope, keyOrKeys, req?)`
+
+Selects the best key and immediately creates a reservation for RPM, TPM, and
+RPD accounting. `keyOrKeys` can be a single key object or an array of keys.
+
+```ts
+const single = await quota.reserve("tenant:acme", key, { tokens: 1_500 });
+const result = await quota.reserve("tenant:acme", keys, { tokens: 1_500 });
+```
+
+Successful result:
+
+```ts
+{
+  ok: true,
+  key,
+  hold,
+  tokens: 1500,
+  waitMs: 0,
+  checks
 }
 ```
 
-`cost` can represent tokens, weighted requests, bytes, credits, or any other
-unit that should be limited over time.
-
-## Token Budget Planning
+Blocked result:
 
 ```ts
-import {
-  calculatePerRequestTokenBudget,
-  calculateTokenBudgetPortion,
-  distributeFlexibleTokenBudget,
-} from "rate-budget";
-
-const totalBudget = calculatePerRequestTokenBudget({
-  tokensPerWindow: 250_000,
-  requestSpacingMs: 5_000,
-  minimumTokens: 96,
-});
-
-const inputBudget = calculateTokenBudgetPortion(totalBudget, 0.5);
-
-const flexible = distributeFlexibleTokenBudget({
-  parentBudget: inputBudget,
-  availableTokens: inputBudget - systemPromptTokens - userPromptTokens,
-  partitions: [
-    { name: "context", targetRatio: 0.55, maxRatio: 0.6 },
-    { name: "metadata", targetRatio: 0.15, maxRatio: 0.2 },
-  ],
-});
-
-console.log(flexible.context, flexible.metadata);
-```
-
-## In-Memory Actor Cooldowns
-
-Use `InMemoryActorCooldownLimiter` for local process cooldowns, such as UX
-cooldowns in a bot or simple API server. For multi-instance systems, store the
-cooldown state in Redis or a database and use the pure helpers instead.
-
-```ts
-import { InMemoryActorCooldownLimiter } from "rate-budget";
-
-const limiter = new InMemoryActorCooldownLimiter({
-  sameActorCooldownMs: 3_000,
-  differentActorCooldownMs: 1_000,
-  stateTtlMs: 5 * 60_000,
-});
-
-const decision = limiter.consume("guild:123", "user:456");
-
-if (!decision.allowed) {
-  console.log(`Retry after ${decision.retryAfterMs}ms`);
+{
+  ok: false,
+  reason: "rpm" | "tpm" | "rpd" | "off" | "no_key",
+  waitMs: 4500,
+  tokens: 1500,
+  checks
 }
 ```
 
-## Retry
+`waitMs` is `null` when the request cannot be handled by any key, for example
+when the estimated token count is larger than every key's TPM limit.
+
+### `commit(hold, usage?)`
+
+Completes a reservation after the request has actually consumed provider quota.
 
 ```ts
-import { retryAsync, isRetryableError } from "rate-budget";
-
-const response = await retryAsync({
-  retryAttempts: 2,
-  delayMs: ({ attemptIndex }) => 1_000 * (attemptIndex + 1),
-  shouldRetry: (error) =>
-    isRetryableError(error, {
-      statusCodes: [429, 500, 502, 503, 504],
-      messageIncludes: ["rate limit", "temporarily unavailable"],
-    }),
-  task: () => fetchProvider(),
-});
+await quota.commit(hold, { tokens: actualTokens });
 ```
 
-## API Overview
+### `rollback(hold)`
 
-- `buildRequestLimitProfile(input)`: creates a normalized RPM, TPM, RPD, threshold, cooldown, and inactive cooldown profile.
-- `calculateLimitSpacingMs(limitPerWindow, options)`: calculates safe request spacing inside a time window.
-- `calculateInactiveLimitSpacingMs(limitPerWindow, options)`: calculates inactive cooldown spacing with a multiplier.
-- `calculateThresholdCount(limit, thresholdPercent)`: calculates a safe quota threshold.
-- `evaluateCountLimit(input)`: evaluates count-based quota usage.
-- `calculateCooldownWaitMs(input)`: calculates remaining cooldown from the last accepted timestamp.
-- `evaluateWindowUsage(input)`: evaluates sliding-window cost usage and returns a detailed decision.
-- `calculateWindowUsageWaitMs(input)`: returns only the wait time for sliding-window cost usage.
-- `calculatePerRequestTokenBudget(input)`: calculates cost or token budget per request.
-- `calculateTokenBudgetPortion(totalBudget, ratio)`: returns a ratio-based budget portion.
-- `distributeFlexibleTokenBudget(input)`: allocates flexible budget across named partitions.
-- `InMemoryActorCooldownLimiter`: local in-memory cooldown per scope and actor.
-- `retryAsync(input)`: retries an async task.
-- `isRetryableError(error, options)`: checks status codes and message fragments.
-- `delay(ms)`: small promise-based delay helper.
+Cancels a reservation when a request was not sent or failed before provider
+quota was consumed.
+
+```ts
+await quota.rollback(hold);
+```
+
+### `check(scope, keyOrKeys, req?)`
+
+Runs a dry check to see which key would be selected without creating a
+reservation. `keyOrKeys` can be a single key object or an array of keys.
+
+```ts
+const single = await quota.check("workspace:42", key, { tokens: 800 });
+const decision = await quota.check("workspace:42", keys, { tokens: 800 });
+```
+
+## Key Shape
+
+```ts
+const key = {
+  id: "key-a",
+  rpm: 15,
+  tpm: 250_000,
+  rpd: 500,
+  priority: 10,
+  enabled: true,
+};
+```
+
+Fields:
+
+- `id`: stable key id.
+- `rpm`: requests per minute.
+- `tpm`: tokens per minute.
+- `rpd`: requests per day.
+- `priority`: higher value is preferred. Defaults to `0`.
+- `enabled`: set `false` to skip a key. Defaults to `true`.
+
+Extra fields are preserved, so you can attach provider names, encrypted key
+references, model names, or metadata.
+
+## Selection Rules
+
+1. Disabled keys are skipped.
+2. A key must pass RPD threshold, RPM cooldown, and TPM window checks.
+3. Among allowed keys, the highest `priority` wins.
+4. Ties prefer lower token pressure, then lower daily pressure, then key id.
+5. If no key is allowed, the result returns the shortest useful `waitMs`.
+
+## Storage Adapter
+
+`MemoryStore` is useful for one process. For multi-instance systems, implement
+`QuotaStore` with Redis, SQL, DynamoDB, or any transactional storage.
+
+```ts
+import { Quota } from "rate-budget";
+
+const store = {
+  async mutate(scope, fn) {
+    return db.transaction(async (tx) => {
+      const state = (await tx.loadQuotaState(scope)) ?? { keys: {} };
+      const result = fn(state);
+
+      await tx.saveQuotaState(scope, state);
+
+      return result;
+    });
+  },
+};
+
+const quota = new Quota({ store });
+```
+
+The `mutate` callback must run atomically per scope. That keeps reservations
+safe when many workers route requests at the same time.
+
+## Helpers
+
+- `cooldownMs(rpm, bufferMs?, windowMs?)`
+- `tokenWaitMs({ used, tokens, limit, hits, now, windowMs?, bufferMs? })`
+- `dailyCap(rpd, thresholdPct?)`
+- `MemoryStore`
+- `QuotaManager` alias for `Quota`
 
 ## Build and Test
-
-```bash
-pnpm --filter rate-budget build
-pnpm --filter rate-budget test
-```
-
-From the package directory:
 
 ```bash
 npm run build
