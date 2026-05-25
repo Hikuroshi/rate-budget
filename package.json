@@ -1,6 +1,6 @@
 {
   "name": "rate-budget",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "A multi-key quota decision engine for RPM, TPM, and RPD-aware routing.",
   "type": "module",
   "license": "MIT",
